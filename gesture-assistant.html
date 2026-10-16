@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Gesture assistant</title>
+<style>
+  :root {
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    --bg:#f3f1f8; --card:#fff; --ink:#1c1a26; --muted:#6b6880; --acc:#7c3aed; --line:#ddd8ec; --accInk:#fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#14121c; --card:#1d1a29; --ink:#ece9f7; --muted:#9b97b3; --acc:#a78bfa; --line:#332e48; --accInk:#14121c; }
+  }
+  :root[data-theme="dark"] { --bg:#14121c; --card:#1d1a29; --ink:#ece9f7; --muted:#9b97b3; --acc:#a78bfa; --line:#332e48; --accInk:#14121c; }
+  html { scroll-padding-top: env(safe-area-inset-top, 0px); }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:system-ui,-apple-system,"Segoe UI",sans-serif; }
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:12px; padding:12px 16px; }
+  h1 { font-size:18px; margin:0 auto 0 0; }
+  h2 { font-size:13px; margin:0 0 6px; color:var(--muted); font-weight:600; }
+  button { font:inherit; font-size:14px; padding:8px 18px; border:0; border-radius:999px; background:var(--acc); color:var(--accInk); cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  button:focus-visible, input:focus-visible { outline:2px solid var(--acc); outline-offset:2px; }
+  label { font-size:14px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+  main { display:flex; flex-wrap:wrap; gap:16px; padding:0 16px 16px; align-items:flex-start; }
+  .cam { position:relative; flex:1 1 420px; max-width:720px; aspect-ratio:4/3; background:#000; border-radius:12px; overflow:hidden; }
+  .cam video, .cam canvas { position:absolute; inset:0; width:100%; height:100%; transform:scaleX(-1); }
+  #ph { position:absolute; inset:0; display:grid; place-items:center; color:#bbb; font-size:14px; padding:20px; text-align:center; }
+  .side { flex:1 1 280px; display:flex; flex-direction:column; gap:12px; min-width:0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  #big { display:flex; align-items:center; gap:14px; }
+  #emoji { font-size:48px; line-height:1; }
+  #label { font-size:26px; font-weight:700; }
+  #heard, #reply { margin:0; font-size:15px; overflow-wrap:anywhere; }
+  #reply { color:var(--acc); margin-top:6px; }
+  #log { margin:0; padding-left:20px; font-size:14px; max-height:160px; overflow:auto; color:var(--muted); }
+  #status { margin:0; font-size:13px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Gesture assistant</h1>
+  <label><input type="checkbox" id="spk" checked> Speak aloud</label>
+  <button id="go">Start camera and mic</button>
+</header>
+<main>
+  <section class="cam">
+    <video id="v" playsinline muted></video>
+    <canvas id="o"></canvas>
+    <div id="ph">Press Start, then allow camera and microphone. Show one hand to the camera.</div>
+  </section>
+  <section class="side">
+    <div class="card" id="big"><div id="emoji">—</div><div id="label">Waiting</div></div>
+    <div class="card">
+      <h2>You said</h2><p id="heard">Say "help" to hear the voice commands.</p>
+      <p id="reply"></p>
+    </div>
+    <div class="card"><h2>Gesture history</h2><ol id="log"></ol></div>
+    <p id="status" role="status" aria-live="polite"></p>
+  </section>
+</main>
+<script type="module">
+const $ = id => document.getElementById(id);
+const video = $("v"), cv = $("o"), g = cv.getContext("2d");
+const VER = "0.10.14";
+const EMOJI = { "Open palm":"🖐️", "Waving":"👋", "Fist":"✊", "Pointing":"☝️", "Peace":"✌️", "Three fingers":"3️⃣",
+  "Four fingers":"4️⃣", "Thumbs up":"👍", "Thumbs down":"👎", "OK sign":"👌", "Rock on":"🤘", "I love you":"🤟",
+  "Call me":"🤙", "Unknown":"❔", "No hand":"—" };
+const LINKS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+let landmarker = null, stream = null, rec = null;
+let running = false, speakOn = true, speaking = false, micOK = true;
+let current = "No hand", cand = "", candN = 0, lastT = -1, wave = [];
+
+const status = t => $("status").textContent = t;
+
+/* ---------- Speech output ---------- */
+function say(text, force) {
+  $("reply").textContent = text;
+  if (!("speechSynthesis" in window) || !(speakOn || force)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  speaking = true;
+  u.onend = u.onerror = () => setTimeout(() => { speaking = false; }, 300);
+  speechSynthesis.speak(u);
+}
+
+/* ---------- Gesture classification ---------- */
+const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function classify(L) {
+  const w = L[0], size = d(L[0], L[9]) || 1e-6;
+  const ext = [[8,6],[12,10],[16,14],[20,18]].map(([t, p]) => d(L[t], w) > d(L[p], w) * 1.08);
+  const [i, m, r, p] = ext;
+  const thumb = d(L[4], L[17]) > d(L[3], L[17]) && d(L[4], L[17]) > d(L[2], L[17]);
+  const n = ext.filter(Boolean).length;
+
+  if (d(L[4], L[8]) < size * 0.35 && m && r && p) return "OK sign";
+  if (n === 4) return thumb ? "Open palm" : "Four fingers";
+  if (n === 0) {
+    const dy = (L[4].y - L[0].y) / size;      // image y points down
+    if (thumb && dy < -0.5) return "Thumbs up";
+    if (thumb && dy > 0.5) return "Thumbs down";
+    return "Fist";
+  }
+  if (i && !m && !r && !p) return "Pointing";
+  if (i && m && !r && !p) return "Peace";
+  if (i && m && r && !p) return "Three fingers";
+  if (i && !m && !r && p) return thumb ? "I love you" : "Rock on";
+  if (!i && !m && !r && p && thumb) return "Call me";
+  return "Unknown";
+}
+
+// A wave is an open palm whose wrist keeps changing horizontal direction.
+function waveCheck(x) {
+  const now = performance.now();
+  wave.push({ t: now, x });
+  wave = wave.filter(s => now - s.t < 1000);
+  if (wave.length < 8) return null;
+  let rev = 0, dir = 0, lo = 1, hi = 0;
+  for (let k = 1; k < wave.length; k++) {
+    const dx = wave[k].x - wave[k - 1].x;
+    lo = Math.min(lo, wave[k].x); hi = Math.max(hi, wave[k].x);
+    if (Math.abs(dx) < 0.008) continue;
+    const s = Math.sign(dx);
+    if (dir && s !== dir) rev++;
+    dir = s;
+  }
+  return rev >= 3 && hi - lo > 0.1 ? "Waving" : null;
+}
+
+/* ---------- Stabilise and announce ---------- */
+function settle(label) {
+  if (label === cand) candN++; else { cand = label; candN = 1; }
+  if (candN < 5 || label === current) return;
+  current = label;
+  $("emoji").textContent = EMOJI[label] || "❔";
+  $("label").textContent = label;
+  if (label === "No hand") return;
+  const li = document.createElement("li");
+  li.textContent = label + "  (" + new Date().toLocaleTimeString() + ")";
+  $("log").prepend(li);
+  while ($("log").children.length > 30) $("log").lastChild.remove();
+  if (label !== "Unknown") say(label);
+}
+
+/* ---------- Drawing ---------- */
+function draw(L) {
+  const W = cv.width, H = cv.height;
+  const acc = getComputedStyle(document.documentElement).getPropertyValue("--acc").trim();
+  g.strokeStyle = acc; g.fillStyle = "#fff"; g.lineWidth = 3; g.lineCap = "round";
+  g.beginPath();
+  for (const [a, b] of LINKS) { g.moveTo(L[a].x * W, L[a].y * H); g.lineTo(L[b].x * W, L[b].y * H); }
+  g.stroke();
+  for (const q of L) { g.beginPath(); g.arc(q.x * W, q.y * H, 4, 0, 7); g.fill(); }
+}
+
+/* ---------- Main loop ---------- */
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastT) {
+    lastT = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    const L = res.landmarks && res.landmarks[0];
+    g.clearRect(0, 0, cv.width, cv.height);
+    let label = "No hand";
+    if (L) {
+      draw(L);
+      label = classify(L);
+      if (label === "Open palm") label = waveCheck(L[0].x) || label; else wave = [];
+    } else wave = [];
+    settle(label);
+  }
+  requestAnimationFrame(loop);
+}
+
+/* ---------- Voice commands ---------- */
+function command(t) {
+  if (/\bclear\b/.test(t)) { $("log").innerHTML = ""; say("History cleared."); }
+  else if (/unmute|speak again|talk again|speak aloud/.test(t)) { speakOn = true; $("spk").checked = true; say("I will speak again.", true); }
+  else if (/\bmute\b|be quiet|stop talking/.test(t)) { say("Okay, I will stay quiet.", true); speakOn = false; $("spk").checked = false; }
+  else if (/what.*(gesture|sign)|which gesture|what am i|read (it|my|the)/.test(t)) {
+    say(current === "No hand" ? "I do not see a hand." : "You are showing: " + current + ".");
+  }
+  else if (/\bhelp\b/.test(t)) say("Say: what gesture, mute, unmute, clear, or hello.", true);
+  else if (/\b(hello|hi|hey)\b/.test(t)) say("Hello. Show me a hand gesture.");
+  else say("I heard: " + t + ". Say help for commands.");
+}
+
+function startVoice() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { $("heard").textContent = "Voice commands need Chrome or Edge. Gestures still work."; return; }
+  rec = new SR();
+  rec.continuous = true; rec.interimResults = false; rec.lang = "en-IN";
+  rec.onresult = e => {
+    for (let k = e.resultIndex; k < e.results.length; k++) {
+      if (!e.results[k].isFinal || speaking) continue;
+      const t = e.results[k][0].transcript.trim().toLowerCase();
+      $("heard").textContent = t;
+      command(t);
+    }
+  };
+  rec.onerror = e => {
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      micOK = false;
+      $("heard").textContent = "Microphone blocked. Allow it from the address bar, then press Start again.";
+    }
+  };
+  rec.onend = () => { if (running && micOK) { try { rec.start(); } catch (_) {} } };
+  micOK = true;
+  try { rec.start(); } catch (_) {}
+}
+
+/* ---------- Start and stop ---------- */
+async function start() {
+  $("go").disabled = true;
+  try {
+    status("Loading hand model (needs internet, about 10 MB)...");
+    if (!landmarker) {
+      const mp = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@" + VER + "/+esm");
+      const files = await mp.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@" + VER + "/wasm");
+      const model = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+      const make = delegate => mp.HandLandmarker.createFromOptions(files, {
+        baseOptions: { modelAssetPath: model, delegate }, runningMode: "VIDEO", numHands: 1 });
+      try { landmarker = await make("GPU"); } catch (_) { landmarker = await make("CPU"); }
+    }
+    status("Starting camera...");
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    cv.width = video.videoWidth; cv.height = video.videoHeight;
+    $("ph").style.display = "none";
+    running = true; lastT = -1;
+    startVoice();
+    $("go").textContent = "Stop";
+    status("Running. Everything is processed in your browser; no video is uploaded.");
+    loop();
+  } catch (err) {
+    status("Could not start: " + (err && err.message ? err.message : err) +
+      ". Check camera permission, internet access, and open this file over http://localhost if it was blocked.");
+  }
+  $("go").disabled = false;
+}
+
+function stop() {
+  running = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (rec) { try { rec.stop(); } catch (_) {} }
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  g.clearRect(0, 0, cv.width, cv.height);
+  $("ph").style.display = "grid";
+  $("go").textContent = "Start camera and mic";
+  status("Stopped.");
+}
+
+$("go").addEventListener("click", () => running ? stop() : start());
+$("spk").addEventListener("change", e => { speakOn = e.target.checked; });
+</script>
+</body>
+</html>
